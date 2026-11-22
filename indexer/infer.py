@@ -24,6 +24,8 @@ def load_model(weights: str, device: torch.device, half: bool = True):
     model = model.to(device).eval()
     if half:
         model = model.half()
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     for p in model.parameters():
         p.requires_grad_(False)
     return model
@@ -43,15 +45,32 @@ class Detector:
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
 
+    MAX_BS = 32
+    BUCKETS = (4, 8, 16, 32)
+
     @torch.inference_mode()
     def __call__(self, batch_u8: torch.Tensor) -> torch.Tensor:
-        """batch_u8: (B, H, W, 3) uint8 BGR letterboxed frames (CPU, ideally pinned).
+        """batch_u8: (B, H, W, 3) uint8 BGR letterboxed frames (CPU).
 
         Returns a (B, 5) int32 CPU tensor: per frame, number of detections of each target class.
+        Batches are split/padded to a few fixed sizes so cuDNN autotuning happens only once per
+        (bucket, shape) instead of for every distinct batch size.
         """
+        outs = []
+        for i in range(0, len(batch_u8), self.MAX_BS):
+            part = batch_u8[i:i + self.MAX_BS]
+            n = len(part)
+            bucket = next(b for b in self.BUCKETS if b >= n)
+            if bucket > n:
+                pad = torch.zeros((bucket - n,) + tuple(part.shape[1:]), dtype=part.dtype)
+                part = torch.cat([part, pad])
+            outs.append(self._run(part)[:n])
+        return torch.cat(outs) if len(outs) > 1 else outs[0]
+
+    def _run(self, batch_u8: torch.Tensor) -> torch.Tensor:
         x = batch_u8.to(self.device, non_blocking=True)
-        x = x.flip(-1).permute(0, 3, 1, 2)  # BGR->RGB, BHWC->BCHW
-        x = x.to(self.dtype).div_(255.0).contiguous()
+        x = x.flip(-1).permute(0, 3, 1, 2)  # BGR->RGB, BHWC->BCHW (NHWC memory = channels_last)
+        x = x.to(self.dtype).div_(255.0).contiguous(memory_format=torch.channels_last)
         pred = self.model(x)
         if isinstance(pred, (list, tuple)):
             pred = pred[0]

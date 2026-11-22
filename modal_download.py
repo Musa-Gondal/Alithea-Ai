@@ -6,7 +6,12 @@ import subprocess
 
 import modal
 
-from modal_app import app, image, vol
+app = modal.App("video-indexing-download")
+vol = modal.Volume.from_name("finevideo", create_if_missing=True)
+image = (modal.Image.debian_slim(python_version="3.11")
+         .pip_install("huggingface_hub[hf_transfer]")
+         .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"}))
+
 
 @app.function(image=image, volumes={"/data": vol}, secrets=[modal.Secret.from_name("huggingface")],
               timeout=3 * 3600, cpu=8)
@@ -17,5 +22,4 @@ def download():
         check=True,
     )
     vol.commit()
-    subprocess.run("ls -la /data/finevideo/data | head; du -sh /data/finevideo", shell=True)
-
+    subprocess.run("ls /data/finevideo/data | wc -l; du -sh /data/finevideo", shell=True)

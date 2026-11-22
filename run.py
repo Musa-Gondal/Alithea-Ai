@@ -67,7 +67,7 @@ def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_r
         task = task_q.get()
         if task is None:
             break
-        vid, data = task
+        vid, data, threads = task
         out_q.put(("start", wid, vid))
         secs, frames = [], []
         n_sent = 0
@@ -83,7 +83,8 @@ def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_r
                 secs, frames = [], []
 
         try:
-            gen = iter_sampled_frames(data, k, decode_threads, fast_resize=fast_resize,
+            gen = iter_sampled_frames(data, k, decode_threads if threads is None else threads,
+                                      fast_resize=fast_resize,
                                      skip_nonref=skip_nonref)
             shape = None
             while True:
@@ -124,37 +125,59 @@ def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_r
 # --------------------------------------------------------------------------------------------
 # reader thread: parquet -> (video id, mp4 bytes)
 # --------------------------------------------------------------------------------------------
-def reader_thread(files, task_q, emit_error, n_workers, stop_evt, stats, max_per_file=0):
+def reader_thread(files, task_q, emit_error, n_workers, stop_evt, stats, max_per_file=0,
+                  tail_threads=0):
+    """Feed (video id, mp4 bytes, decode threads) to the decoders, biggest videos of each row group
+    first so long videos don't start last. Videos of the last file get more decode threads,
+    because near the end of the run there are fewer videos left than CPU cores."""
+    import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
-    for path in files:
+    for fi, path in enumerate(files):
         name = path.name
-        row = 0
+        last_file = fi == len(files) - 1
         try:
             pf = pq.ParquetFile(str(path))
-            for batch in pf.iter_batches(batch_size=1, columns=["mp4"]):
-                if max_per_file and row >= max_per_file:
-                    break
-                col = batch.column(0)
-                for i in range(len(col)):
-                    if max_per_file and row >= max_per_file:
-                        break
-                    vid = f"{name}:{row}"
-                    row += 1
-                    v = col[i]
-                    if not v.is_valid:
-                        emit_error(vid, "missing mp4 bytes")
-                        continue
-                    data = v.as_py()
-                    if not data:
-                        emit_error(vid, "empty mp4 bytes")
-                        continue
-                    stats["videos"] += 1
-                    task_q.put((vid, data))
-                    if stop_evt.is_set():
-                        return
+            n_groups = pf.metadata.num_row_groups
         except Exception as e:
-            emit_error(f"{name}:{row}", f"could not read parquet: {type(e).__name__}")
+            emit_error(f"{name}:0", f"could not read parquet: {type(e).__name__}")
+            continue
+        base = 0
+        for g in range(n_groups):
+            try:
+                n_rows = pf.metadata.row_group(g).num_rows
+            except Exception:
+                n_rows = 0
+            try:
+                col = pf.read_row_group(g, columns=["mp4"]).column(0).combine_chunks()
+            except Exception as e:
+                msg = f"could not read parquet row group: {type(e).__name__}"
+                for r in range(max(1, n_rows)):
+                    if not max_per_file or base + r < max_per_file:
+                        emit_error(f"{name}:{base + r}", msg)
+                base += n_rows
+                continue
+            lens = pc.fill_null(pc.binary_length(col), 0).to_numpy(zero_copy_only=False)
+            order = np.argsort(-lens, kind="stable")
+            for i in order:
+                row = base + int(i)
+                if max_per_file and row >= max_per_file:
+                    continue
+                vid = f"{name}:{row}"
+                v = col[int(i)]
+                if not v.is_valid:
+                    emit_error(vid, "missing mp4 bytes")
+                    continue
+                data = v.as_py()
+                if not data:
+                    emit_error(vid, "empty mp4 bytes")
+                    continue
+                stats["videos"] += 1
+                task_q.put((vid, data, tail_threads if last_file else None))
+                if stop_evt.is_set():
+                    return
+            base += len(col)
+            del col
     for _ in range(n_workers):
         task_q.put(None)
 
@@ -170,9 +193,10 @@ def main():
     ap.add_argument("--fps-samples", type=int, default=int(os.environ.get("SAMPLES_PER_SEC", 3)),
                     help="frames analysed per second of video (<=0: every frame)")
     ap.add_argument("--workers", type=int, default=0)
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--chunk", type=int, default=32)
     ap.add_argument("--decode-threads", type=int, default=2)
+    ap.add_argument("--tail-threads", type=int, default=6, help="decode threads for the last file")
     ap.add_argument("--fp32", action="store_true")
     ap.add_argument("--fast-resize", type=int, default=int(os.environ.get("FAST_RESIZE", 0)))
     ap.add_argument("--skip-nonref", type=int, default=int(os.environ.get("SKIP_NONREF", 0)))
@@ -236,7 +260,7 @@ def main():
     stop_evt = threading.Event()
     rt = threading.Thread(target=reader_thread,
                           args=(files, task_q, emit_error, n_workers, stop_evt, stats,
-                                args.max_videos_per_file), daemon=True)
+                                args.max_videos_per_file, args.tail_threads), daemon=True)
     rt.start()
 
     # per-video state
@@ -270,28 +294,68 @@ def main():
                 out_f.write("\n".join(lines) + "\n")
         stats["done"] += 1
 
+    # GPU work runs in its own thread so that receiving/concatenating frames overlaps inference
+    infer_q = queue.Queue(maxsize=3)
+    done_q = queue.Queue()
+    inflight = [0]
+
+    def infer_loop():
+        nonlocal t_gpu
+        while True:
+            job = infer_q.get()
+            if job is None:
+                break
+            items, x = job
+            t0 = time.time()
+            try:
+                counts = det(x).numpy()
+            except Exception as e:  # never lose the bookkeeping, even on a GPU error
+                print(f"[run] inference error: {e}", file=sys.stderr, flush=True)
+                counts = np.zeros((len(x), 5), np.int32)
+            t_gpu += time.time() - t0
+            done_q.put((items, counts))
+
+    it = threading.Thread(target=infer_loop, daemon=True)
+    it.start()
+
+    def process_done(block=False):
+        nonlocal n_frames
+        while inflight[0]:
+            try:
+                items, counts = done_q.get(block=block, timeout=1.0 if block else None)
+            except queue.Empty:
+                if block:
+                    continue
+                return
+            inflight[0] -= 1
+            n_frames += len(counts)
+            off = 0
+            touched = set()
+            for vid, secs, t in items:
+                n = len(t)
+                vsecs[vid].append(secs)
+                vcounts[vid].append(counts[off:off + n])
+                vdone_frames[vid] += n
+                off += n
+                touched.add(vid)
+            for vid in touched:
+                if vid in vend and vdone_frames[vid] >= vend[vid][1]:
+                    finalize(vid)
+            if block:
+                block = False
+
     def run_batch(shape):
-        nonlocal t_gpu, n_frames
         items = pending.pop(shape)
         pending_n.pop(shape, None)
         tensors = [t for _, _, t in items]
         x = tensors[0] if len(tensors) == 1 else torch.cat(tensors)
-        t0 = time.time()
-        counts = det(x).numpy()
-        t_gpu += time.time() - t0
-        n_frames += len(x)
-        off = 0
-        touched = set()
-        for vid, secs, t in items:
-            n = len(t)
-            vsecs[vid].append(secs)
-            vcounts[vid].append(counts[off:off + n])
-            vdone_frames[vid] += n
-            off += n
-            touched.add(vid)
-        for vid in touched:
-            if vid in vend and vdone_frames[vid] >= vend[vid][1]:
-                finalize(vid)
+        inflight[0] += 1
+        while True:
+            try:
+                infer_q.put((items, x), timeout=0.05)
+                break
+            except queue.Full:
+                process_done()
 
     def flush_vid(vid):
         for shape in [s for s, items in pending.items() if any(v == vid for v, _, _ in items)]:
@@ -323,10 +387,11 @@ def main():
 
     last_report = time.time()
     while len(byes) < n_workers:
+        process_done()
         try:
             msg = out_q.get(timeout=0.02)
         except queue.Empty:
-            if pending:
+            if pending and infer_q.qsize() == 0:  # GPU about to idle: send a partial batch
                 run_batch(max(pending_n, key=pending_n.get))
                 continue
             # liveness check: replace crashed decoders
@@ -335,6 +400,8 @@ def main():
                     vid = worker_vid.pop(wid, None)
                     if vid is not None and vid not in vend:
                         flush_vid(vid)
+                        while inflight[0]:
+                            process_done(block=True)
                         secs = vsecs.get(vid)
                         last = int(max(a.max() for a in secs)) - 1 if secs else -1
                         vend[vid] = (last, vdone_frames[vid], "decoder crashed")
@@ -354,6 +421,10 @@ def main():
 
     for shape in list(pending):
         run_batch(shape)
+    while inflight[0]:
+        process_done(block=True)
+    infer_q.put(None)
+    it.join()
     for vid in list(vend):
         finalize(vid)
     shutdown.set()
