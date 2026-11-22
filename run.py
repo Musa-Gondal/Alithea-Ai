@@ -27,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 DEFAULT_WEIGHTS = HERE / "weights" / "yolo11l.pt"
+DEFAULT_ENGINE = HERE / "weights" / "yolo11l_fp16.engine"
 
 
 # --------------------------------------------------------------------------------------------
@@ -214,6 +215,8 @@ def main():
     ap.add_argument("--decode-threads", type=int, default=2)
     ap.add_argument("--tail-threads", type=int, default=6, help="decode threads for the last file")
     ap.add_argument("--fp32", action="store_true")
+    ap.add_argument("--engine", default=os.environ.get("YOLO_ENGINE", str(DEFAULT_ENGINE)))
+    ap.add_argument("--no-trt", action="store_true", help="ignore the TensorRT engine")
     ap.add_argument("--fast-resize", type=int, default=int(os.environ.get("FAST_RESIZE", 1)))
     ap.add_argument("--skip-nonref", type=int, default=int(os.environ.get("SKIP_NONREF", 1)))
     ap.add_argument("--device", default="cuda")
@@ -279,7 +282,9 @@ def main():
     from indexer.aggregate import video_lines
     from indexer.infer import Detector
 
-    det = Detector(args.weights, device=args.device, half=not args.fp32)
+    engine = None if args.no_trt or args.fp32 else args.engine
+    det = Detector(args.weights, device=args.device, half=not args.fp32, engine=engine)
+    print(f"[run] inference backend: {det.backend}", file=sys.stderr, flush=True)
 
     stats = defaultdict(int)
     stop_evt = threading.Event()

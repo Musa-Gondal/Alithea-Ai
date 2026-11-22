@@ -30,6 +30,22 @@ def main():
     YOLO(str(DEST))
     print("torch", torch.__version__, "cuda available:", torch.cuda.is_available())
 
+    # TensorRT FP16 engine for this GPU (optional: run.py falls back to PyTorch without it)
+    if torch.cuda.is_available() and "--no-trt" not in sys.argv:
+        sys.path.insert(0, str(DEST.parent.parent))
+        from indexer.trt import build_engine
+
+        engine = DEST.parent / "yolo11l_fp16.engine"
+        try:
+            if not engine.exists():
+                print("building TensorRT engine (a few minutes)...", flush=True)
+                build_engine(str(DEST), str(engine))
+            print(f"engine: {engine} ({engine.stat().st_size / 1e6:.1f} MB)")
+        except Exception as e:
+            print(f"TensorRT engine build failed ({type(e).__name__}: {e}); run.py will use PyTorch")
+            if engine.exists():
+                engine.unlink()
+
 
 if __name__ == "__main__":
     sys.exit(main())

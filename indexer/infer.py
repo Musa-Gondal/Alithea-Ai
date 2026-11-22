@@ -4,6 +4,9 @@ Only per-frame counts of the five target classes are produced; boxes never leave
 """
 from __future__ import annotations
 
+import os
+import sys
+
 import torch
 import torchvision
 
@@ -32,11 +35,23 @@ def load_model(weights: str, device: torch.device, half: bool = True):
 
 
 class Detector:
-    def __init__(self, weights: str, device: str = "cuda", half: bool = True):
+    def __init__(self, weights: str, device: str = "cuda", half: bool = True, engine: str | None = None):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         self.half = half and self.device.type == "cuda"
         self.dtype = torch.float16 if self.half else torch.float32
-        self.model = load_model(weights, self.device, self.half)
+        self.backend = "torch"
+        self.model = None
+        if engine and self.device.type == "cuda" and os.path.exists(engine):
+            try:
+                from .trt import TRTModel
+
+                self.model = TRTModel(engine, self.device)
+                self.backend = "tensorrt"
+            except Exception as e:  # fall back to PyTorch if TensorRT is unusable here
+                print(f"[infer] TensorRT engine unusable ({type(e).__name__}: {e}); using PyTorch",
+                      file=sys.stderr, flush=True)
+        if self.model is None:
+            self.model = load_model(weights, self.device, self.half)
         # map coco id -> local index 0..4, everything else -> -1
         lut = torch.full((128,), -1, dtype=torch.long)
         for i, c in enumerate(CLASS_IDS):
@@ -70,7 +85,10 @@ class Detector:
     def _run(self, batch_u8: torch.Tensor) -> torch.Tensor:
         x = batch_u8.to(self.device, non_blocking=True)
         x = x.flip(-1).permute(0, 3, 1, 2)  # BGR->RGB, BHWC->BCHW (NHWC memory = channels_last)
-        x = x.to(self.dtype).div_(255.0).contiguous(memory_format=torch.channels_last)
+        if self.backend == "tensorrt":
+            x = x.to(torch.float16).div_(255.0).contiguous()
+        else:
+            x = x.to(self.dtype).div_(255.0).contiguous(memory_format=torch.channels_last)
         pred = self.model(x)
         if isinstance(pred, (list, tuple)):
             pred = pred[0]

@@ -34,8 +34,18 @@ for bs in (32, 64, 128):
 m = m.to(memory_format=torch.channels_last)
 for bs in (32, 64, 128):
     print("channels_last", bs, f"{bench(m, bs, True):.0f} img/s", flush=True)
-try:
-    mc = torch.compile(m, mode="max-autotune-no-cudagraphs", dynamic=False)
-    print("compiled cl 64", f"{bench(mc, 64, True):.0f} img/s", flush=True)
-except Exception as e:
-    print("compile failed", e)
+eng = os.environ.get("YOLO_ENGINE")
+if eng and os.path.exists(eng):
+    from indexer.trt import TRTModel
+
+    tm = TRTModel(eng, dev)
+    for bs in (16, 32):
+        x = torch.rand(bs, 3, 384, 640, device=dev, dtype=torch.float16)
+        for _ in range(5):
+            tm(x)
+        torch.cuda.synchronize()
+        t = time.time()
+        for _ in range(30):
+            tm(x)
+        torch.cuda.synchronize()
+        print("tensorrt", bs, f"{bs * 30 / (time.time() - t):.0f} img/s", flush=True)

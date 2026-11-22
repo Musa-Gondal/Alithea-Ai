@@ -5,3 +5,5 @@ av==15.1.0
 pyarrow==20.0.0
 numpy==2.2.6
 opencv-python==4.11.0.86
+onnx==1.18.0
+tensorrt-cu12==10.13.3.9
