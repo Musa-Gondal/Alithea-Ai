@@ -55,13 +55,18 @@ def list_parquets(folder: Path):
 # --------------------------------------------------------------------------------------------
 # decoder worker process
 # --------------------------------------------------------------------------------------------
-def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_resize=False,
-                  skip_nonref=False):
-    import torch
+SLOT_BYTES_PER_FRAME = 640 * 640 * 3  # largest letterboxed frame
 
-    torch.set_num_threads(1)
-    torch.multiprocessing.set_sharing_strategy("file_system")
+
+def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_resize=False,
+                  skip_nonref=False, shm_name=None, free_q=None):
+    from multiprocessing import shared_memory
+
     from indexer.decode import DecodeError, iter_sampled_frames
+
+    shm = shared_memory.SharedMemory(name=shm_name)
+    slot_bytes = chunk * SLOT_BYTES_PER_FRAME
+    ring = np.ndarray((shm.size // slot_bytes, slot_bytes), dtype=np.uint8, buffer=shm.buf)
 
     while True:
         task = task_q.get()
@@ -69,6 +74,7 @@ def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_r
             break
         vid, data, threads = task
         out_q.put(("start", wid, vid))
+        t_v0 = time.time()
         secs, frames = [], []
         n_sent = 0
         error = None
@@ -77,9 +83,13 @@ def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_r
         def flush():
             nonlocal secs, frames, n_sent
             if frames:
-                t = torch.from_numpy(np.stack(frames))
-                out_q.put(("frames", vid, np.asarray(secs, dtype=np.int32), t))
-                n_sent += len(frames)
+                slot = free_q.get()
+                shape = frames[0].shape
+                n = len(frames)
+                dst = ring[slot, : n * SLOT_BYTES_PER_FRAME][: n * int(np.prod(shape))]
+                np.stack(frames, out=dst.reshape((n,) + shape))
+                out_q.put(("frames", vid, np.asarray(secs, dtype=np.int32), slot, n, shape))
+                n_sent += n
                 secs, frames = [], []
 
         try:
@@ -115,11 +125,17 @@ def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_r
             error = f"decode failed: {type(e).__name__}"
             # keep only seconds that were fully decoded
             last_sec = last_sec - 1 if last_sec >= 0 else -1
+        dt = time.time() - t_v0
+        if dt > 20 and os.environ.get("VERBOSE"):
+            print(f"[worker {wid}] {vid} {len(data) / 1e6:.0f} MB {last_sec + 1}s video took {dt:.0f}s "
+                  f"(threads={threads})", file=sys.stderr, flush=True)
         del data
         out_q.put(("end", vid, int(last_sec), n_sent, error))
     # shared-memory tensors die with their producer: stay alive until the main process is done
     out_q.put(("bye", wid))
     shutdown.wait()
+    del ring
+    shm.close()
 
 
 # --------------------------------------------------------------------------------------------
@@ -198,8 +214,8 @@ def main():
     ap.add_argument("--decode-threads", type=int, default=2)
     ap.add_argument("--tail-threads", type=int, default=6, help="decode threads for the last file")
     ap.add_argument("--fp32", action="store_true")
-    ap.add_argument("--fast-resize", type=int, default=int(os.environ.get("FAST_RESIZE", 0)))
-    ap.add_argument("--skip-nonref", type=int, default=int(os.environ.get("SKIP_NONREF", 0)))
+    ap.add_argument("--fast-resize", type=int, default=int(os.environ.get("FAST_RESIZE", 1)))
+    ap.add_argument("--skip-nonref", type=int, default=int(os.environ.get("SKIP_NONREF", 1)))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit-files", type=int, default=0)
     ap.add_argument("--skip-files", type=int, default=0)
@@ -216,7 +232,6 @@ def main():
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
     except Exception:
         pass
-    mp.set_sharing_strategy("file_system")
 
     files = list_parquets(Path(args.input))[args.skip_files:]
     if args.limit_files:
@@ -239,11 +254,21 @@ def main():
     shutdown = ctx.Event()
     task_q = ctx.Queue(maxsize=max(2, n_workers))
     out_q = ctx.Queue(maxsize=max(64, 4 * n_workers))
+    # frames travel through a shared-memory ring of fixed-size slots; queues carry only slot ids
+    from multiprocessing import shared_memory
+
+    n_slots = max(16, 3 * n_workers)
+    slot_bytes = args.chunk * SLOT_BYTES_PER_FRAME
+    shm = shared_memory.SharedMemory(create=True, size=n_slots * slot_bytes)
+    ring = np.ndarray((n_slots, slot_bytes), dtype=np.uint8, buffer=shm.buf)
+    free_q = ctx.Queue()
+    for i in range(n_slots):
+        free_q.put(i)
 
     def spawn(wid):
         p = ctx.Process(target=decode_worker,
                         args=(wid, task_q, out_q, args.fps_samples, args.chunk, args.decode_threads,
-                              shutdown, args.fast_resize, args.skip_nonref),
+                              shutdown, args.fast_resize, args.skip_nonref, shm.name, free_q),
                         daemon=True)
         p.start()
         return p
@@ -364,8 +389,11 @@ def main():
     def handle(msg):
         kind = msg[0]
         if kind == "frames":
-            _, vid, secs, t = msg
-            shape = tuple(t.shape[1:])
+            _, vid, secs, slot, n, fshape = msg
+            arr = ring[slot, : n * int(np.prod(fshape))].reshape((n,) + tuple(fshape)).copy()
+            free_q.put(slot)
+            t = torch.from_numpy(arr)
+            shape = tuple(fshape)
             pending[shape].append((vid, secs, t))
             pending_n[shape] += len(t)
             if pending_n[shape] >= args.batch:
@@ -430,6 +458,12 @@ def main():
     shutdown.set()
     for p in procs.values():
         p.join(timeout=5)
+    del ring
+    try:
+        shm.close()
+        shm.unlink()
+    except Exception:
+        pass
 
     rt.join(timeout=5)
     out_f.close()
