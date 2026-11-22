@@ -73,6 +73,10 @@ class TRTModel:
         self.in_dtype = torch.float16 if self.engine.get_tensor_dtype(self.in_name) == trt.DataType.HALF else torch.float32
         self.out_dtype = torch.float16 if self.engine.get_tensor_dtype(self.out_name) == trt.DataType.HALF else torch.float32
 
+    @staticmethod
+    def supports(shape) -> bool:
+        return all(lo <= v <= hi for lo, v, hi in zip(MIN_SHAPE, shape, MAX_SHAPE))
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         x = x.to(self.in_dtype).contiguous()
         self.context.set_input_shape(self.in_name, tuple(x.shape))

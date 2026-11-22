@@ -39,6 +39,8 @@ class Detector:
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         self.half = half and self.device.type == "cuda"
         self.dtype = torch.float16 if self.half else torch.float32
+        self.weights = weights
+        self.torch_model = None
         self.backend = "torch"
         self.model = None
         if engine and self.device.type == "cuda" and os.path.exists(engine):
@@ -51,7 +53,7 @@ class Detector:
                 print(f"[infer] TensorRT engine unusable ({type(e).__name__}: {e}); using PyTorch",
                       file=sys.stderr, flush=True)
         if self.model is None:
-            self.model = load_model(weights, self.device, self.half)
+            self.model = self.torch_model = load_model(weights, self.device, self.half)
         # map coco id -> local index 0..4, everything else -> -1
         lut = torch.full((128,), -1, dtype=torch.long)
         for i, c in enumerate(CLASS_IDS):
@@ -85,11 +87,19 @@ class Detector:
     def _run(self, batch_u8: torch.Tensor) -> torch.Tensor:
         x = batch_u8.to(self.device, non_blocking=True)
         x = x.flip(-1).permute(0, 3, 1, 2)  # BGR->RGB, BHWC->BCHW (NHWC memory = channels_last)
-        if self.backend == "tensorrt":
-            x = x.to(torch.float16).div_(255.0).contiguous()
-        else:
+        pred = None
+        if self.backend == "tensorrt" and self.model.supports(tuple(x.shape)):
+            try:
+                pred = self.model(x.to(torch.float16).div_(255.0).contiguous())
+            except Exception as e:
+                print(f"[infer] TensorRT call failed ({e}); using PyTorch for this batch",
+                      file=sys.stderr, flush=True)
+                pred = None
+        if pred is None:
+            if self.torch_model is None:  # e.g. an aspect ratio outside the engine's profile
+                self.torch_model = load_model(self.weights, self.device, self.half)
             x = x.to(self.dtype).div_(255.0).contiguous(memory_format=torch.channels_last)
-        pred = self.model(x)
+            pred = self.torch_model(x)
         if isinstance(pred, (list, tuple)):
             pred = pred[0]
         return self.postprocess(pred.float())

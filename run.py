@@ -217,6 +217,7 @@ def main():
     ap.add_argument("--fp32", action="store_true")
     ap.add_argument("--engine", default=os.environ.get("YOLO_ENGINE", str(DEFAULT_ENGINE)))
     ap.add_argument("--no-trt", action="store_true", help="ignore the TensorRT engine")
+    ap.add_argument("--infer-threads", type=int, default=2)
     ap.add_argument("--fast-resize", type=int, default=int(os.environ.get("FAST_RESIZE", 1)))
     ap.add_argument("--skip-nonref", type=int, default=int(os.environ.get("SKIP_NONREF", 1)))
     ap.add_argument("--device", default="cuda")
@@ -283,8 +284,11 @@ def main():
     from indexer.infer import Detector
 
     engine = None if args.no_trt or args.fp32 else args.engine
-    det = Detector(args.weights, device=args.device, half=not args.fp32, engine=engine)
-    print(f"[run] inference backend: {det.backend}", file=sys.stderr, flush=True)
+    # several inference threads, each with its own model/TensorRT context and CUDA stream, so the
+    # host->device copy and post-processing of one batch overlap the network of another
+    dets = [Detector(args.weights, device=args.device, half=not args.fp32, engine=engine)
+            for _ in range(max(1, args.infer_threads))]
+    print(f"[run] inference backend: {dets[0].backend} x{len(dets)}", file=sys.stderr, flush=True)
 
     stats = defaultdict(int)
     stop_evt = threading.Event()
@@ -325,12 +329,15 @@ def main():
         stats["done"] += 1
 
     # GPU work runs in its own thread so that receiving/concatenating frames overlaps inference
-    infer_q = queue.Queue(maxsize=3)
+    infer_q = queue.Queue(maxsize=2 + len(dets))
     done_q = queue.Queue()
     inflight = [0]
 
-    def infer_loop():
+    gpu_lock = threading.Lock()
+
+    def infer_loop(det):
         nonlocal t_gpu
+        stream = torch.cuda.Stream() if det.device.type == "cuda" else None
         while True:
             job = infer_q.get()
             if job is None:
@@ -338,15 +345,21 @@ def main():
             items, x = job
             t0 = time.time()
             try:
-                counts = det(x).numpy()
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        counts = det(x).numpy()
+                else:
+                    counts = det(x).numpy()
             except Exception as e:  # never lose the bookkeeping, even on a GPU error
                 print(f"[run] inference error: {e}", file=sys.stderr, flush=True)
                 counts = np.zeros((len(x), 5), np.int32)
-            t_gpu += time.time() - t0
+            with gpu_lock:
+                t_gpu += (time.time() - t0) / len(dets)
             done_q.put((items, counts))
 
-    it = threading.Thread(target=infer_loop, daemon=True)
-    it.start()
+    its = [threading.Thread(target=infer_loop, args=(d,), daemon=True) for d in dets]
+    for it in its:
+        it.start()
 
     def process_done(block=False):
         nonlocal n_frames
@@ -456,8 +469,10 @@ def main():
         run_batch(shape)
     while inflight[0]:
         process_done(block=True)
-    infer_q.put(None)
-    it.join()
+    for it in its:
+        infer_q.put(None)
+    for it in its:
+        it.join()
     for vid in list(vend):
         finalize(vid)
     shutdown.set()
