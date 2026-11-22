@@ -1,0 +1,2 @@
+# Share links for web AI chats used for this task (ChatGPT / Claude.ai / Gemini), one per line.
+# The main development chat is the Claude Code session in claude_code_session.jsonl.

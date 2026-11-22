@@ -99,3 +99,14 @@ Progress is printed to stderr every 30 s. Useful options (defaults are the submi
 - `modal_app.py`, `modal_download.py`: how I ran it on Modal (not needed by graders).
 - `results.jsonl.gz`: results for the 50 files.
 - `HARDWARE.md`, `WRITEUP.md`, `ai_chats/`.
+
+## Results on the 50 training files
+
+**Run time.** Modal L40S, 16 vCPU (see `HARDWARE.md`): **906 s** for 1,650 videos (125 h), with 0 errors.
+
+**Accuracy against references built with every frame:**
+
+| reference | videos | object F1 | people exact | people ±1 |
+|---|---|---|---|---|
+| plain Ultralytics `predict`, FP32, every frame | 16 | 0.985 | 94.3 % | 99.8 % |
+| this pipeline with `--fps-samples 0` (every frame) | 50 | 0.987 | 94.9 % | 99.7 % |
