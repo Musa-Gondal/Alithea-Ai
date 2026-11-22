@@ -77,7 +77,8 @@ class DecodeError(Exception):
     pass
 
 
-def iter_sampled_frames(data: bytes, k: int, decode_threads: int = 0, raw: bool = False):
+def iter_sampled_frames(data: bytes, k: int, decode_threads: int = 0, raw: bool = False,
+                        fast_resize: bool = False, skip_nonref: bool = False):
     """Decode a video and yield (second, letterboxed_bgr_uint8) for up to k frames per second.
 
     k <= 0 means "every frame" (used to build the reference).
@@ -96,6 +97,10 @@ def iter_sampled_frames(data: bytes, k: int, decode_threads: int = 0, raw: bool 
         stream.thread_type = "AUTO"
         if decode_threads:
             stream.thread_count = decode_threads
+        if skip_nonref and k > 0:
+            # B-frames nobody references are never needed for decoding others; we only lose
+            # candidates for sampling. The last-second bookkeeping uses packet timestamps.
+            stream.codec_context.skip_frame = "NONREF"
         tb = stream.time_base
         fps = float(stream.average_rate or stream.guessed_rate or 30)
 
@@ -109,12 +114,35 @@ def iter_sampled_frames(data: bytes, k: int, decode_threads: int = 0, raw: bool 
         idx = 0
 
         def convert(fr):
+            if fast_resize and not raw:
+                # resize + yuv->bgr in one swscale pass (bilinear), then rotate the small image
+                h, w = fr.height, fr.width
+                rh, rw = (w, h) if rot in (90, 270) else (h, w)
+                new_w, new_h, *_ = letterbox_shape(rh, rw)
+                tw, th = (new_h, new_w) if rot in (90, 270) else (new_w, new_h)
+                img = fr.reformat(width=tw, height=th, format="bgr24",
+                                  interpolation="BILINEAR").to_ndarray()
+                if rot:
+                    img = _rotate(img, rot)
+                return letterbox(img)
             img = fr.to_ndarray(format="bgr24")
             if rot:
                 img = _rotate(img, rot)
             return img if raw else letterbox(img)
 
-        for frame in container.decode(stream):
+        max_pkt_t = None
+
+        def frames():
+            nonlocal max_pkt_t
+            for packet in container.demux(stream):
+                if packet.pts is not None and tb is not None:
+                    pt = float(packet.pts * tb)
+                    if max_pkt_t is None or pt > max_pkt_t:
+                        max_pkt_t = pt
+                for fr in packet.decode():
+                    yield fr
+
+        for frame in frames():
             if frame.pts is not None and tb is not None:
                 t = float(frame.pts * tb)
             else:
@@ -149,6 +177,9 @@ def iter_sampled_frames(data: bytes, k: int, decode_threads: int = 0, raw: bool 
                 pending = frame
         if pending is not None and taken == 0:
             yield cur_sec, convert(pending)
+        if skip_nonref and t0 is not None and max_pkt_t is not None:
+            # skipped frames may extend past the last decoded one
+            last_sec = max(last_sec, int(math.floor(max_pkt_t - t0)))
         return last_sec
     finally:
         try:

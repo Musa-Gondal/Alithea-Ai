@@ -55,7 +55,8 @@ def list_parquets(folder: Path):
 # --------------------------------------------------------------------------------------------
 # decoder worker process
 # --------------------------------------------------------------------------------------------
-def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown):
+def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown, fast_resize=False,
+                  skip_nonref=False):
     import torch
 
     torch.set_num_threads(1)
@@ -82,7 +83,8 @@ def decode_worker(wid, task_q, out_q, k, chunk, decode_threads, shutdown):
                 secs, frames = [], []
 
         try:
-            gen = iter_sampled_frames(data, k, decode_threads)
+            gen = iter_sampled_frames(data, k, decode_threads, fast_resize=fast_resize,
+                                     skip_nonref=skip_nonref)
             shape = None
             while True:
                 try:
@@ -172,6 +174,8 @@ def main():
     ap.add_argument("--chunk", type=int, default=32)
     ap.add_argument("--decode-threads", type=int, default=2)
     ap.add_argument("--fp32", action="store_true")
+    ap.add_argument("--fast-resize", type=int, default=int(os.environ.get("FAST_RESIZE", 0)))
+    ap.add_argument("--skip-nonref", type=int, default=int(os.environ.get("SKIP_NONREF", 0)))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit-files", type=int, default=0)
     ap.add_argument("--skip-files", type=int, default=0)
@@ -215,7 +219,7 @@ def main():
     def spawn(wid):
         p = ctx.Process(target=decode_worker,
                         args=(wid, task_q, out_q, args.fps_samples, args.chunk, args.decode_threads,
-                              shutdown),
+                              shutdown, args.fast_resize, args.skip_nonref),
                         daemon=True)
         p.start()
         return p
