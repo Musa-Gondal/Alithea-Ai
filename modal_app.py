@@ -33,6 +33,15 @@ def sh(cmd: str):
     return p.returncode
 
 
+@app.function(image=image, volumes={"/data": vol}, gpu="L40S", cpu=16, memory=65536, timeout=6 * 3600,
+              block_network=True)
+def sh_offline(cmd: str):
+    """Same as `sh` but with no network access, like the graders' timed run."""
+    p = subprocess.run(cmd, shell=True)
+    vol.commit()
+    return p.returncode
+
+
 @app.local_entrypoint()
-def main(cmd: str = "nvidia-smi; nproc; free -g; lscpu | head -20"):
-    print(sh.remote(cmd))
+def main(cmd: str = "nvidia-smi; nproc; free -g; lscpu | head -20", offline: bool = False):
+    print((sh_offline if offline else sh).remote(cmd))

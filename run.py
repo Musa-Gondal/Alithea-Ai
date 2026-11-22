@@ -218,6 +218,7 @@ def main():
     ap.add_argument("--engine", default=os.environ.get("YOLO_ENGINE", str(DEFAULT_ENGINE)))
     ap.add_argument("--no-trt", action="store_true", help="ignore the TensorRT engine")
     ap.add_argument("--infer-threads", type=int, default=2)
+    ap.add_argument("--pinned", type=int, default=1)
     ap.add_argument("--fast-resize", type=int, default=int(os.environ.get("FAST_RESIZE", 1)))
     ap.add_argument("--skip-nonref", type=int, default=int(os.environ.get("SKIP_NONREF", 1)))
     ap.add_argument("--device", default="cuda")
@@ -391,7 +392,13 @@ def main():
         items = pending.pop(shape)
         pending_n.pop(shape, None)
         tensors = [t for _, _, t in items]
-        x = tensors[0] if len(tensors) == 1 else torch.cat(tensors)
+        if args.pinned and torch.cuda.is_available():
+            # page-locked staging buffer: faster, truly asynchronous host->device copies
+            n = sum(len(t) for t in tensors)
+            x = torch.empty((n,) + tuple(tensors[0].shape[1:]), dtype=torch.uint8, pin_memory=True)
+            torch.cat(tensors, out=x)
+        else:
+            x = tensors[0] if len(tensors) == 1 else torch.cat(tensors)
         inflight[0] += 1
         while True:
             try:
